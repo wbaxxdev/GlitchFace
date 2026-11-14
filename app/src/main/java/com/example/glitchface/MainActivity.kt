@@ -1,18 +1,9 @@
 package com.example.glitchface
 
-import android.content.ContentValues
-import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
-import android.graphics.Canvas as AndroidCanvas
-import android.graphics.ImageDecoder
-import android.graphics.Paint as AndroidPaint
-import android.graphics.PorterDuff
-import android.graphics.PorterDuffColorFilter
 import android.graphics.Rect
-import android.net.Uri
 import android.os.Bundle
-import android.provider.MediaStore
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -41,7 +32,9 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -51,15 +44,27 @@ import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.Redo
+import androidx.compose.material.icons.automirrored.rounded.Undo
 import androidx.compose.material.icons.rounded.AddPhotoAlternate
 import androidx.compose.material.icons.rounded.AutoFixHigh
+import androidx.compose.material.icons.rounded.BlurOn
+import androidx.compose.material.icons.rounded.Crop
+import androidx.compose.material.icons.rounded.EmojiEmotions
 import androidx.compose.material.icons.rounded.FaceRetouchingNatural
+import androidx.compose.material.icons.rounded.Gif
+import androidx.compose.material.icons.rounded.GridOn
+import androidx.compose.material.icons.rounded.PhotoLibrary
 import androidx.compose.material.icons.rounded.Save
 import androidx.compose.material.icons.rounded.Share
 import androidx.compose.material.icons.rounded.Shuffle
@@ -70,8 +75,11 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilledTonalIconButton
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
@@ -81,6 +89,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.Stable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
@@ -101,6 +110,7 @@ import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
@@ -109,16 +119,11 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.google.mlkit.vision.common.InputImage
-import com.google.mlkit.vision.face.FaceDetection
-import com.google.mlkit.vision.face.FaceDetectorOptions
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
-import kotlin.math.max
-import kotlin.random.Random
+import kotlin.math.abs
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -150,6 +155,81 @@ private fun GlitchTheme(content: @Composable () -> Unit) {
     )
 }
 
+// ---------------- состояние редактора ----------------
+
+private data class Snap(val enabled: Set<Int>, val manual: List<Rect>)
+
+@Stable
+private class Editor {
+    var original by mutableStateOf<Bitmap?>(null)
+    var processed by mutableStateOf<Bitmap?>(null)
+    var faces by mutableStateOf<List<Rect>>(emptyList())
+    var manual by mutableStateOf<List<Rect>>(emptyList())
+    var enabled by mutableStateOf<Set<Int>>(emptySet())
+    var detecting by mutableStateOf(false)
+    var busy by mutableStateOf<String?>(null)
+    var seed by mutableIntStateOf(1)
+    var mode by mutableStateOf(Mode.GLITCH)
+    var palette by mutableStateOf(Palette.PINK)
+    var emoji by mutableStateOf("😎")
+    var intensity by mutableFloatStateOf(0.6f)
+    var watermark by mutableStateOf("")
+    var drawMode by mutableStateOf(false)
+    var showOriginal by mutableStateOf(false)
+    var undo by mutableStateOf<List<Snap>>(emptyList())
+    var redo by mutableStateOf<List<Snap>>(emptyList())
+
+    val all: List<Rect> get() = faces + manual
+
+    fun params() = Params(mode, intensity, palette, emoji, watermark, seed)
+
+    fun selected(): List<IndexedValue<Rect>> = all.withIndex().filter { it.index in enabled }
+
+    fun clear() {
+        original = null
+        processed = null
+        faces = emptyList()
+        manual = emptyList()
+        enabled = emptySet()
+        undo = emptyList()
+        redo = emptyList()
+        drawMode = false
+        showOriginal = false
+    }
+
+    private fun commit(e: Set<Int>, m: List<Rect>) {
+        undo = undo + Snap(enabled, manual)
+        redo = emptyList()
+        enabled = e
+        manual = m
+    }
+
+    fun toggle(i: Int) = commit(if (i in enabled) enabled - i else enabled + i, manual)
+
+    fun addManual(r: Rect) {
+        val idx = faces.size + manual.size
+        commit(enabled + idx, manual + r)
+    }
+
+    fun doUndo() {
+        val s = undo.lastOrNull() ?: return
+        redo = redo + Snap(enabled, manual)
+        undo = undo.dropLast(1)
+        enabled = s.enabled
+        manual = s.manual
+    }
+
+    fun doRedo() {
+        val s = redo.lastOrNull() ?: return
+        undo = undo + Snap(enabled, manual)
+        redo = redo.dropLast(1)
+        enabled = s.enabled
+        manual = s.manual
+    }
+}
+
+// ---------------- экран ----------------
+
 @Composable
 private fun GlitchApp() {
     val context = LocalContext.current
@@ -161,19 +241,10 @@ private fun GlitchApp() {
             snack.showSnackbar(m)
         }
     }
-
-    var original by remember { mutableStateOf<Bitmap?>(null) }
-    var processed by remember { mutableStateOf<Bitmap?>(null) }
-    var faces by remember { mutableStateOf<List<Rect>>(emptyList()) }
-    var enabled by remember { mutableStateOf<Set<Int>>(emptySet()) }
-    var detecting by remember { mutableStateOf(false) }
-    var seed by remember { mutableIntStateOf(1) }
-    var intensity by remember { mutableFloatStateOf(0.6f) }
-    var vhs by remember { mutableStateOf(true) }
-    var headerShown by remember { mutableStateOf(false) }
+    val ed = remember { Editor() }
     val shake = remember { Animatable(0f) }
     val spin = remember { Animatable(0f) }
-
+    var headerShown by remember { mutableStateOf(false) }
     LaunchedEffect(Unit) { headerShown = true }
 
     val picker = rememberLauncherForActivityResult(
@@ -181,43 +252,62 @@ private fun GlitchApp() {
     ) { uri ->
         if (uri == null) return@rememberLauncherForActivityResult
         scope.launch {
-            detecting = true
-            original = null
-            processed = null
-            faces = emptyList()
-            enabled = emptySet()
+            ed.detecting = true
+            ed.clear()
             try {
                 val bmp = withContext(Dispatchers.Default) { decode(context, uri) }
-                original = bmp
+                ed.original = bmp
                 val found = detectFaces(bmp)
-                faces = found
-                enabled = found.indices.toSet()
-                if (found.isEmpty()) say("Лица не найдены")
-            } catch (e: Exception) {
-                say("Ошибка: ${e.message}")
+                ed.faces = found
+                ed.enabled = found.indices.toSet()
+                if (found.isEmpty()) say("Лица не найдены. Выдели область вручную")
+            } catch (ex: Exception) {
+                say("Ошибка: ${ex.message}")
             } finally {
-                detecting = false
+                ed.detecting = false
             }
         }
     }
 
-    LaunchedEffect(original, faces, enabled, seed, intensity, vhs) {
-        val o = original
-        if (o == null || faces.isEmpty()) {
-            processed = null
+    val batchPicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.PickMultipleVisualMedia(30)
+    ) { uris ->
+        if (uris.isEmpty()) return@rememberLauncherForActivityResult
+        scope.launch {
+            ed.busy = "Обработка 0/${uris.size}"
+            val ok = processBatch(context, uris, ed.params()) { n, total ->
+                ed.busy = "Обработка $n/$total"
+            }
+            ed.busy = null
+            say("Готово: сохранено $ok из ${uris.size} (Pictures/GlitchFace)")
+        }
+    }
+
+    LaunchedEffect(
+        ed.original, ed.faces, ed.manual, ed.enabled,
+        ed.mode, ed.palette, ed.emoji, ed.intensity, ed.watermark, ed.seed
+    ) {
+        val o = ed.original
+        val sel = ed.selected()
+        if (o == null || (sel.isEmpty() && ed.watermark.isBlank())) {
+            ed.processed = null
             return@LaunchedEffect
         }
-        delay(30)
-        val sel = faces.withIndex().filter { it.index in enabled }
-        processed = withContext(Dispatchers.Default) { glitch(o, sel, seed, intensity, vhs) }
+        delay(60)
+        val p = ed.params()
+        ed.processed = withContext(Dispatchers.Default) { render(o, sel, p) }
     }
 
     val pick = {
         picker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
     }
-    val hasImage = original != null
-    val ready = hasImage && !detecting
-    val current = processed ?: original
+    val batch = {
+        batchPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+    }
+    val hasImage = ed.original != null
+    val ready = hasImage && !ed.detecting
+    val current = ed.processed ?: ed.original
+    val shown = if (ed.showOriginal) ed.original else current
 
     Scaffold(
         containerColor = Bg,
@@ -232,13 +322,21 @@ private fun GlitchApp() {
             Column(
                 Modifier
                     .fillMaxSize()
-                    .padding(horizontal = 20.dp),
+                    .padding(horizontal = 20.dp)
+                    .imePadding(),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
                 AnimatedVisibility(
                     headerShown,
                     enter = fadeIn(tween(700)) + slideInVertically(tween(700)) { -it }
-                ) { Header() }
+                ) {
+                    Header(
+                        canUndo = ed.undo.isNotEmpty(),
+                        canRedo = ed.redo.isNotEmpty(),
+                        onUndo = { ed.doUndo() },
+                        onRedo = { ed.doRedo() }
+                    )
+                }
 
                 Box(
                     Modifier
@@ -247,99 +345,107 @@ private fun GlitchApp() {
                         .padding(vertical = 12.dp),
                     contentAlignment = Alignment.Center
                 ) {
-                    val shown = current
                     if (shown == null) {
-                        EmptyState(detecting, pick)
+                        EmptyState(ed.detecting, pick, batch)
                     } else {
                         PhotoStage(
                             shown = shown,
-                            faces = faces,
-                            enabled = enabled,
-                            detecting = detecting,
-                            shakeX = { shake.value }
-                        ) { i -> enabled = if (i in enabled) enabled - i else enabled + i }
+                            faces = ed.all,
+                            enabled = ed.enabled,
+                            detecting = ed.detecting,
+                            drawMode = ed.drawMode,
+                            shakeX = { shake.value },
+                            onToggle = { ed.toggle(it) },
+                            onDraw = { ed.addManual(it) },
+                            onHold = { ed.showOriginal = it }
+                        )
                     }
                 }
 
-                AnimatedVisibility(
-                    ready && faces.isNotEmpty(),
-                    enter = fadeIn() + expandVertically()
-                ) {
-                    Controls(
-                        total = faces.size,
-                        active = enabled.size,
-                        intensity = intensity,
-                        onIntensity = { intensity = it },
-                        vhs = vhs,
-                        onVhs = { vhs = it }
-                    )
+                AnimatedVisibility(ready, enter = fadeIn() + expandVertically()) {
+                    Controls(ed)
                 }
 
-                AnimatedVisibility(
-                    hasImage,
-                    enter = fadeIn() + slideInVertically { it }
-                ) {
-                    val btn = IconButtonDefaults.filledTonalIconButtonColors(
-                        containerColor = CardBg,
-                        contentColor = Color.White,
-                        disabledContainerColor = CardBg.copy(alpha = 0.5f),
-                        disabledContentColor = Color.White.copy(alpha = 0.3f)
-                    )
-                    Row(
+                AnimatedVisibility(hasImage, enter = fadeIn() + slideInVertically { it }) {
+                    Column(
                         Modifier
                             .fillMaxWidth()
-                            .padding(vertical = 14.dp),
-                        horizontalArrangement = Arrangement.spacedBy(10.dp),
-                        verticalAlignment = Alignment.CenterVertically
+                            .padding(vertical = 12.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
-                        Button(
-                            onClick = pick,
-                            modifier = Modifier
-                                .weight(1f)
-                                .height(52.dp),
-                            shape = RoundedCornerShape(16.dp)
-                        ) {
-                            Icon(Icons.Rounded.AddPhotoAlternate, null, Modifier.size(20.dp))
-                            Spacer(Modifier.width(8.dp))
-                            Text("Другое фото", fontWeight = FontWeight.SemiBold)
+                        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                            Button(
+                                onClick = pick,
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(50.dp),
+                                shape = RoundedCornerShape(16.dp)
+                            ) {
+                                Icon(Icons.Rounded.AddPhotoAlternate, null, Modifier.size(20.dp))
+                                Spacer(Modifier.width(8.dp))
+                                Text("Другое фото", fontWeight = FontWeight.SemiBold)
+                            }
+                            OutlinedButton(
+                                onClick = batch,
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(50.dp),
+                                shape = RoundedCornerShape(16.dp)
+                            ) {
+                                Icon(Icons.Rounded.PhotoLibrary, null, Modifier.size(20.dp))
+                                Spacer(Modifier.width(8.dp))
+                                Text("Пакет", fontWeight = FontWeight.SemiBold)
+                            }
                         }
-                        FilledTonalIconButton(
-                            onClick = {
-                                seed++
+                        Row(
+                            Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceEvenly
+                        ) {
+                            ActionButton(
+                                Icons.Rounded.Shuffle, "Другой", ready && ed.selected().isNotEmpty(),
+                                rotate = { spin.value }
+                            ) {
+                                ed.seed++
                                 scope.launch {
                                     for (v in listOf(16f, -16f, 9f, -5f, 0f)) {
                                         shake.animateTo(v, tween(45))
                                     }
                                 }
                                 scope.launch { spin.animateTo(spin.value + 360f, tween(450)) }
-                            },
-                            enabled = ready && faces.isNotEmpty(),
-                            modifier = Modifier.size(52.dp),
-                            colors = btn
-                        ) {
-                            Icon(
-                                Icons.Rounded.Shuffle, null,
-                                Modifier.graphicsLayer { rotationZ = spin.value }
-                            )
-                        }
-                        FilledTonalIconButton(
-                            onClick = {
+                            }
+                            ActionButton(Icons.Rounded.Save, "Сохранить", ready) {
                                 current?.let { b ->
                                     scope.launch {
-                                        val u = saveBitmap(context, b)
+                                        val u = saveJpeg(context, b)
                                         say(if (u != null) "Сохранено в Pictures/GlitchFace" else "Не удалось сохранить")
                                     }
                                 }
-                            },
-                            enabled = ready,
-                            modifier = Modifier.size(52.dp),
-                            colors = btn
-                        ) { Icon(Icons.Rounded.Save, null) }
-                        FilledTonalIconButton(
-                            onClick = {
+                            }
+                            ActionButton(Icons.Rounded.Gif, "GIF", ready) {
+                                val o = ed.original
+                                val sel = ed.selected()
+                                if (o == null) return@ActionButton
+                                if (ed.mode != Mode.GLITCH) {
+                                    say("GIF-анимация работает в режиме «Глитч»")
+                                } else if (sel.isEmpty()) {
+                                    say("Выбери хотя бы одно лицо")
+                                } else {
+                                    scope.launch {
+                                        ed.busy = "Собираю GIF…"
+                                        val u = try {
+                                            exportGif(context, o, sel, ed.params())
+                                        } catch (ex: Exception) {
+                                            null
+                                        }
+                                        ed.busy = null
+                                        say(if (u != null) "GIF сохранён в Pictures/GlitchFace" else "Не удалось собрать GIF")
+                                    }
+                                }
+                            }
+                            ActionButton(Icons.Rounded.Share, "Отправить", ready) {
                                 current?.let { b ->
                                     scope.launch {
-                                        val u = saveBitmap(context, b)
+                                        val u = saveJpeg(context, b)
                                         if (u != null) {
                                             val send = Intent(Intent.ACTION_SEND).apply {
                                                 type = "image/jpeg"
@@ -350,11 +456,24 @@ private fun GlitchApp() {
                                         }
                                     }
                                 }
-                            },
-                            enabled = ready,
-                            modifier = Modifier.size(52.dp),
-                            colors = btn
-                        ) { Icon(Icons.Rounded.Share, null) }
+                            }
+                        }
+                    }
+                }
+            }
+
+            AnimatedVisibility(ed.busy != null, enter = fadeIn(), exit = fadeOut()) {
+                Box(
+                    Modifier
+                        .fillMaxSize()
+                        .background(Color.Black.copy(alpha = 0.65f))
+                        .pointerInput(Unit) { detectTapGestures { } },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        CircularProgressIndicator(color = Pink)
+                        Spacer(Modifier.height(14.dp))
+                        Text(ed.busy ?: "", color = Color.White, fontWeight = FontWeight.SemiBold)
                     }
                 }
             }
@@ -363,7 +482,38 @@ private fun GlitchApp() {
 }
 
 @Composable
-private fun Header() {
+private fun ActionButton(
+    icon: ImageVector,
+    label: String,
+    enabled: Boolean,
+    rotate: () -> Float = { 0f },
+    onClick: () -> Unit
+) {
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        FilledTonalIconButton(
+            onClick = onClick,
+            enabled = enabled,
+            modifier = Modifier.size(52.dp),
+            colors = IconButtonDefaults.filledTonalIconButtonColors(
+                containerColor = CardBg,
+                contentColor = Color.White,
+                disabledContainerColor = CardBg.copy(alpha = 0.5f),
+                disabledContentColor = Color.White.copy(alpha = 0.3f)
+            )
+        ) {
+            Icon(icon, null, Modifier.graphicsLayer { rotationZ = rotate() })
+        }
+        Text(
+            label,
+            color = Color.White.copy(alpha = 0.6f),
+            fontSize = 11.sp,
+            modifier = Modifier.padding(top = 3.dp)
+        )
+    }
+}
+
+@Composable
+private fun Header(canUndo: Boolean, canRedo: Boolean, onUndo: () -> Unit, onRedo: () -> Unit) {
     Row(
         Modifier
             .fillMaxWidth()
@@ -383,7 +533,7 @@ private fun Header() {
             )
         }
         Spacer(Modifier.width(12.dp))
-        Column {
+        Column(Modifier.weight(1f)) {
             Text(
                 "GlitchFace",
                 style = TextStyle(
@@ -398,11 +548,23 @@ private fun Header() {
                 fontSize = 13.sp
             )
         }
+        IconButton(onClick = onUndo, enabled = canUndo) {
+            Icon(
+                Icons.AutoMirrored.Rounded.Undo, null,
+                tint = if (canUndo) Color.White else Color.White.copy(alpha = 0.25f)
+            )
+        }
+        IconButton(onClick = onRedo, enabled = canRedo) {
+            Icon(
+                Icons.AutoMirrored.Rounded.Redo, null,
+                tint = if (canRedo) Color.White else Color.White.copy(alpha = 0.25f)
+            )
+        }
     }
 }
 
 @Composable
-private fun EmptyState(loading: Boolean, onPick: () -> Unit) {
+private fun EmptyState(loading: Boolean, onPick: () -> Unit, onBatch: () -> Unit) {
     val t = rememberInfiniteTransition(label = "pulse")
     val phase by t.animateFloat(
         initialValue = 0f, targetValue = 1f,
@@ -461,10 +623,20 @@ private fun EmptyState(loading: Boolean, onPick: () -> Unit) {
         )
         Spacer(Modifier.height(6.dp))
         Text(
-            "Все найденные лица закроются глитчем",
+            "Все найденные лица закроются эффектом",
             color = Color.White.copy(alpha = 0.6f), fontSize = 14.sp,
             textAlign = TextAlign.Center
         )
+        Spacer(Modifier.height(18.dp))
+        OutlinedButton(
+            onClick = onBatch,
+            enabled = !loading,
+            shape = RoundedCornerShape(16.dp)
+        ) {
+            Icon(Icons.Rounded.PhotoLibrary, null, Modifier.size(20.dp))
+            Spacer(Modifier.width(8.dp))
+            Text("Пакетная обработка")
+        }
     }
 }
 
@@ -474,10 +646,18 @@ private fun PhotoStage(
     faces: List<Rect>,
     enabled: Set<Int>,
     detecting: Boolean,
+    drawMode: Boolean,
     shakeX: () -> Float,
-    onToggle: (Int) -> Unit
+    onToggle: (Int) -> Unit,
+    onDraw: (Rect) -> Unit,
+    onHold: (Boolean) -> Unit
 ) {
     val toggle by rememberUpdatedState(onToggle)
+    val draw by rememberUpdatedState(onDraw)
+    val hold by rememberUpdatedState(onHold)
+    var dragStart by remember { mutableStateOf<Offset?>(null) }
+    var dragEnd by remember { mutableStateOf<Offset?>(null) }
+
     val appear by animateFloatAsState(if (detecting) 0f else 1f, tween(600), label = "appear")
     val inf = rememberInfiniteTransition(label = "scan")
     val scan by inf.animateFloat(
@@ -494,13 +674,50 @@ private fun PhotoStage(
             .graphicsLayer { translationX = shakeX() }
             .clip(shape)
             .border(1.dp, Color.White.copy(alpha = 0.12f), shape)
-            .pointerInput(faces, shown) {
-                detectTapGestures { off ->
-                    val s = shown.width / size.width.toFloat()
-                    val x = (off.x * s).toInt()
-                    val y = (off.y * s).toInt()
-                    val hit = faces.indices.lastOrNull { faces[it].contains(x, y) }
-                    if (hit != null) toggle(hit)
+            .pointerInput(faces, shown, drawMode) {
+                if (drawMode) {
+                    detectDragGestures(
+                        onDragStart = {
+                            dragStart = it
+                            dragEnd = it
+                        },
+                        onDragEnd = {
+                            val a = dragStart
+                            val b = dragEnd
+                            if (a != null && b != null) {
+                                val s = shown.width / size.width.toFloat()
+                                val r = Rect(
+                                    (minOf(a.x, b.x) * s).toInt().coerceIn(0, shown.width),
+                                    (minOf(a.y, b.y) * s).toInt().coerceIn(0, shown.height),
+                                    (maxOf(a.x, b.x) * s).toInt().coerceIn(0, shown.width),
+                                    (maxOf(a.y, b.y) * s).toInt().coerceIn(0, shown.height)
+                                )
+                                if (r.width() >= 24 && r.height() >= 24) draw(r)
+                            }
+                            dragStart = null
+                            dragEnd = null
+                        },
+                        onDragCancel = {
+                            dragStart = null
+                            dragEnd = null
+                        },
+                        onDrag = { change, _ -> dragEnd = change.position }
+                    )
+                } else {
+                    detectTapGestures(
+                        onPress = {
+                            hold(true)
+                            tryAwaitRelease()
+                            hold(false)
+                        },
+                        onTap = { off ->
+                            val s = shown.width / size.width.toFloat()
+                            val x = (off.x * s).toInt()
+                            val y = (off.y * s).toInt()
+                            val hit = faces.indices.lastOrNull { faces[it].contains(x, y) }
+                            if (hit != null) toggle(hit)
+                        }
+                    )
                 }
             }
     ) {
@@ -538,31 +755,34 @@ private fun PhotoStage(
                     )
                 )
             }
+            val a = dragStart
+            val b = dragEnd
+            if (a != null && b != null) {
+                val tl = Offset(minOf(a.x, b.x), minOf(a.y, b.y))
+                val sz = Size(abs(b.x - a.x), abs(b.y - a.y))
+                drawRect(Pink.copy(alpha = 0.2f), topLeft = tl, size = sz)
+                drawRect(Pink, topLeft = tl, size = sz, style = Stroke(width = 3f))
+            }
         }
     }
 }
 
 @Composable
-private fun Controls(
-    total: Int,
-    active: Int,
-    intensity: Float,
-    onIntensity: (Float) -> Unit,
-    vhs: Boolean,
-    onVhs: (Boolean) -> Unit
-) {
+private fun Controls(ed: Editor) {
     Column(
         Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(22.dp))
             .background(CardBg)
-            .padding(16.dp)
+            .heightIn(max = 230.dp)
+            .verticalScroll(rememberScrollState())
+            .padding(14.dp)
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Icon(Icons.Rounded.TouchApp, null, tint = Pink, modifier = Modifier.size(20.dp))
             Spacer(Modifier.width(8.dp))
             AnimatedContent(
-                targetState = active,
+                targetState = ed.enabled.size,
                 transitionSpec = {
                     (slideInVertically { -it } + fadeIn()) togetherWith
                         (slideOutVertically { it } + fadeOut())
@@ -570,21 +790,78 @@ private fun Controls(
                 label = "count"
             ) { n ->
                 Text(
-                    "Закрыто лиц: $n из $total",
+                    "Закрыто лиц: $n из ${ed.all.size}",
                     color = Color.White, fontWeight = FontWeight.SemiBold
                 )
             }
         }
         Text(
-            "Нажми на рамку на фото, чтобы включить или выключить лицо",
+            "Нажми на рамку: вкл/выкл. Удерживай фото: оригинал.",
             color = Color.White.copy(alpha = 0.55f), fontSize = 12.sp,
-            modifier = Modifier.padding(top = 4.dp)
+            modifier = Modifier.padding(top = 4.dp, bottom = 8.dp)
         )
-        Row(Modifier.padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+
+        Row(
+            Modifier.horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Mode.values().forEach { m ->
+                FilterChip(
+                    selected = ed.mode == m,
+                    onClick = { ed.mode = m },
+                    label = { Text(m.label) },
+                    leadingIcon = {
+                        Icon(
+                            when (m) {
+                                Mode.GLITCH -> Icons.Rounded.AutoFixHigh
+                                Mode.PIXEL -> Icons.Rounded.GridOn
+                                Mode.BLUR -> Icons.Rounded.BlurOn
+                                Mode.EMOJI -> Icons.Rounded.EmojiEmotions
+                            },
+                            null, Modifier.size(18.dp)
+                        )
+                    }
+                )
+            }
+        }
+
+        AnimatedVisibility(ed.mode == Mode.EMOJI) {
+            Row(
+                Modifier
+                    .padding(top = 8.dp)
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                EMOJIS.forEach { em ->
+                    FilterChip(
+                        selected = ed.emoji == em,
+                        onClick = { ed.emoji = em },
+                        label = { Text(em, fontSize = 20.sp) }
+                    )
+                }
+            }
+        }
+
+        Row(
+            Modifier
+                .padding(top = 8.dp)
+                .horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Palette.values().forEach { pal ->
+                FilterChip(
+                    selected = ed.palette == pal,
+                    onClick = { ed.palette = pal },
+                    label = { Text(pal.label) }
+                )
+            }
+        }
+
+        Row(Modifier.padding(top = 4.dp), verticalAlignment = Alignment.CenterVertically) {
             Icon(Icons.Rounded.Tune, null, tint = Color.White.copy(alpha = 0.7f), modifier = Modifier.size(20.dp))
             Slider(
-                value = intensity,
-                onValueChange = onIntensity,
+                value = ed.intensity,
+                onValueChange = { ed.intensity = it },
                 modifier = Modifier
                     .weight(1f)
                     .padding(horizontal = 8.dp),
@@ -595,131 +872,23 @@ private fun Controls(
                 )
             )
         }
+
         FilterChip(
-            selected = vhs,
-            onClick = { onVhs(!vhs) },
-            label = { Text("VHS-фильтр") },
-            leadingIcon = { Icon(Icons.Rounded.AutoFixHigh, null, Modifier.size(18.dp)) }
+            selected = ed.drawMode,
+            onClick = { ed.drawMode = !ed.drawMode },
+            label = { Text(if (ed.drawMode) "Рисую область: проведи по фото" else "Своя область") },
+            leadingIcon = { Icon(Icons.Rounded.Crop, null, Modifier.size(18.dp)) }
+        )
+
+        OutlinedTextField(
+            value = ed.watermark,
+            onValueChange = { ed.watermark = it.take(32) },
+            singleLine = true,
+            label = { Text("Водяной знак, например @ник") },
+            shape = RoundedCornerShape(14.dp),
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(top = 10.dp)
         )
     }
-}
-
-// ---------------- логика ----------------
-
-private fun decode(context: Context, uri: Uri): Bitmap {
-    val bmp = ImageDecoder.decodeBitmap(
-        ImageDecoder.createSource(context.contentResolver, uri)
-    ) { d, info, _ ->
-        d.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
-        val m = max(info.size.width, info.size.height)
-        if (m > 2048) {
-            val k = 2048f / m
-            d.setTargetSize((info.size.width * k).toInt(), (info.size.height * k).toInt())
-        }
-    }
-    return if (bmp.config != Bitmap.Config.ARGB_8888) bmp.copy(Bitmap.Config.ARGB_8888, false) else bmp
-}
-
-private suspend fun detectFaces(bmp: Bitmap): List<Rect> {
-    val detector = FaceDetection.getClient(
-        FaceDetectorOptions.Builder()
-            .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_ACCURATE)
-            .setMinFaceSize(0.04f)
-            .build()
-    )
-    try {
-        val found = detector.process(InputImage.fromBitmap(bmp, 0)).await()
-        val bounds = Rect(0, 0, bmp.width, bmp.height)
-        return found.mapNotNull { f ->
-            val b = f.boundingBox
-            val px = (b.width() * 0.2f).toInt()
-            val py = (b.height() * 0.25f).toInt()
-            val r = Rect(b.left - px, b.top - py, b.right + px, b.bottom + py)
-            if (r.intersect(bounds) && r.width() >= 8 && r.height() >= 8) r else null
-        }.sortedBy { it.left }
-    } finally {
-        detector.close()
-    }
-}
-
-private fun glitch(
-    src: Bitmap,
-    faces: List<IndexedValue<Rect>>,
-    seed: Int,
-    intensity: Float,
-    vhs: Boolean
-): Bitmap {
-    val out = src.copy(Bitmap.Config.ARGB_8888, true)
-    val canvas = AndroidCanvas(out)
-    val gap = AndroidPaint().apply { color = android.graphics.Color.argb(210, 255, 255, 255) }
-
-    for ((i, r) in faces) {
-        val rnd = Random(seed * 1000 + i)
-        val piece = Bitmap.createBitmap(src, r.left, r.top, r.width(), r.height())
-        val w = piece.width
-        val hgt = piece.height
-
-        val minH = max(2, hgt / 90)
-        val maxH = max(minH + 1, (hgt / (8f + 28f * intensity)).toInt())
-        val winMin = max(2, w / 12)
-        val winMax = max(winMin + 1, (w * (0.75f - 0.55f * intensity)).toInt())
-        val gapChance = 0.04f + 0.10f * intensity
-
-        var y = 0
-        while (y < hgt) {
-            val h = minOf(rnd.nextInt(minH, maxH), hgt - y)
-            val winW = minOf(rnd.nextInt(winMin, winMax), w)
-            val winX = rnd.nextInt(0, max(1, w - winW + 1))
-            val srcRect = Rect(winX, y, winX + winW, y + h)
-            val dst = Rect(r.left, r.top + y, r.right, r.top + y + h)
-            canvas.drawBitmap(piece, srcRect, dst, null)
-
-            if (rnd.nextFloat() < gapChance) {
-                val x0 = r.left + rnd.nextInt(0, max(1, w / 2))
-                val gw = rnd.nextInt(max(1, w / 8), max(2, w / 2))
-                canvas.drawRect(
-                    x0.toFloat(), dst.top.toFloat(),
-                    (x0 + gw).toFloat(), dst.bottom.toFloat(), gap
-                )
-            }
-            y += h
-        }
-        piece.recycle()
-    }
-
-    if (!vhs) return out
-
-    val tinted = Bitmap.createBitmap(out.width, out.height, Bitmap.Config.ARGB_8888)
-    val c2 = AndroidCanvas(tinted)
-    val tint = AndroidPaint().apply {
-        colorFilter = PorterDuffColorFilter(
-            android.graphics.Color.argb(45, 200, 140, 220), PorterDuff.Mode.SRC_ATOP
-        )
-    }
-    c2.drawBitmap(out, 0f, 0f, tint)
-    val line = AndroidPaint().apply {
-        color = android.graphics.Color.argb(32, 0, 0, 0)
-        strokeWidth = 1f
-    }
-    var yy = 0
-    while (yy < tinted.height) {
-        c2.drawLine(0f, yy.toFloat(), tinted.width.toFloat(), yy.toFloat(), line)
-        yy += 3
-    }
-    out.recycle()
-    return tinted
-}
-
-private suspend fun saveBitmap(context: Context, bmp: Bitmap): Uri? = withContext(Dispatchers.IO) {
-    val values = ContentValues().apply {
-        put(MediaStore.Images.Media.DISPLAY_NAME, "glitch_${System.currentTimeMillis()}.jpg")
-        put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
-        put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/GlitchFace")
-    }
-    val uri = context.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
-        ?: return@withContext null
-    context.contentResolver.openOutputStream(uri)?.use {
-        bmp.compress(Bitmap.CompressFormat.JPEG, 95, it)
-    }
-    uri
 }
